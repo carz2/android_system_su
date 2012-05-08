@@ -59,14 +59,14 @@ static int from_init(struct su_initiator *from)
     snprintf(path, sizeof(path), "/proc/%u/cmdline", from->pid);
     fd = open(path, O_RDONLY);
     if (fd < 0) {
-        SLOGE("Opening command line");
+        PLOGE("Opening command line");
         return -1;
     }
     len = read(fd, args, sizeof(args));
     err = errno;
     close(fd);
     if (len < 0 || len == sizeof(args)) {
-        SLOGE("Reading command line", err);
+        PLOGEV("Reading command line", err);
         return -1;
     }
 
@@ -94,7 +94,7 @@ static int from_init(struct su_initiator *from)
     snprintf(path, sizeof(path), "/proc/%u/exe", from->pid);
     len = readlink(path, exe, sizeof(exe));
     if (len < 0) {
-        SLOGE("Getting exe path");
+        PLOGE("Getting exe path");
         return -1;
     }
     exe[len] = '\0';
@@ -149,7 +149,7 @@ static int socket_create_temp(char *path, size_t len)
 
     fd = socket(AF_LOCAL, SOCK_STREAM, 0);
     if (fd < 0) {
-        SLOGE("socket");
+        PLOGE("socket");
         return -1;
     }
 
@@ -166,12 +166,12 @@ static int socket_create_temp(char *path, size_t len)
     unlink(sun.sun_path);
 
     if (bind(fd, (struct sockaddr*)&sun, sizeof(sun)) < 0) {
-        SLOGE("bind");
+        PLOGE("bind");
         goto err;
     }
 
     if (listen(fd, 1) < 0) {
-        SLOGE("listen");
+        PLOGE("listen");
         goto err;
     }
 
@@ -193,13 +193,13 @@ static int socket_accept(int serv_fd)
     FD_ZERO(&fds);
     FD_SET(serv_fd, &fds);
     if (select(serv_fd + 1, &fds, NULL, NULL, &tv) < 1) {
-        SLOGE("select");
+        PLOGE("select");
         return -1;
     }
 
     fd = accept(serv_fd, NULL, NULL);
     if (fd < 0) {
-        SLOGE("accept");
+        PLOGE("accept");
         return -1;
     }
 
@@ -218,7 +218,7 @@ do {							\
 	size_t __count = sizeof(__data);		\
 	size_t __len = write((fd), &__data, __count);	\
 	if (__len != __count) {				\
-		SLOGE("write(" #data ")");		\
+		PLOGE("write(" #data ")");		\
 		return -1;				\
 	}						\
 } while (0)
@@ -232,7 +232,7 @@ do {							\
     write_token(fd, bin_size);
     len = write(fd, ctx->from.bin, bin_size);
     if (len != bin_size) {
-        SLOGE("write(bin)");
+        PLOGE("write(bin)");
         return -1;
     }
     cmd = get_command(&ctx->to);
@@ -240,7 +240,7 @@ do {							\
     write_token(fd, cmd_size);
     len = write(fd, cmd, cmd_size);
     if (len != cmd_size) {
-        SLOGE("write(cmd)");
+        PLOGE("write(cmd)");
         return -1;
     }
     return 0;
@@ -252,7 +252,7 @@ static int socket_receive_result(int fd, char *result, ssize_t result_len)
     
     len = read(fd, result, result_len-1);
     if (len < 0) {
-        SLOGE("read(result)");
+        PLOGE("read(result)");
         return -1;
     }
     result[len] = '\0';
@@ -284,7 +284,7 @@ static void deny(const struct su_context *ctx)
     char *cmd = get_command(&ctx->to);
 
     send_intent(ctx, "", 0, ACTION_RESULT);
-    ALOGW("request rejected (%u->%u %s)", ctx->from.uid, ctx->to.uid, cmd);
+    LOGW("request rejected (%u->%u %s)", ctx->from.uid, ctx->to.uid, cmd);
     fprintf(stderr, "%s\n", strerror(EACCES));
     exit(EXIT_FAILURE);
 }
@@ -316,18 +316,18 @@ static void allow(const struct su_context *ctx)
      * if ctx->to.uid isn't root.
      */
     if (seteuid(0)) {
-        SLOGE("seteuid (root)");
+        PLOGE("seteuid (root)");
         exit(EXIT_FAILURE);
     }
 
     populate_environment(ctx);
 
     if (setresgid(ctx->to.uid, ctx->to.uid, ctx->to.uid)) {
-        SLOGE("setresgid (%u)", ctx->to.uid);
+        PLOGE("setresgid (%u)", ctx->to.uid);
         exit(EXIT_FAILURE);
     }
     if (setresuid(ctx->to.uid, ctx->to.uid, ctx->to.uid)) {
-        SLOGE("setresuid (%u)", ctx->to.uid);
+        PLOGE("setresuid (%u)", ctx->to.uid);
         exit(EXIT_FAILURE);
     }
 
@@ -335,7 +335,7 @@ static void allow(const struct su_context *ctx)
     (ctx->to.optind + (arg) < ctx->to.argc) ? " " : "",					\
     (ctx->to.optind + (arg) < ctx->to.argc) ? ctx->to.argv[ctx->to.optind + (arg)] : ""
 
-    ALOGD("%u %s executing %u %s using shell %s : %s%s%s%s%s%s%s%s%s%s%s%s%s%s",
+    LOGD("%u %s executing %u %s using shell %s : %s%s%s%s%s%s%s%s%s%s%s%s%s%s",
             ctx->from.uid, ctx->from.bin,
             ctx->to.uid, get_command(&ctx->to), ctx->to.shell,
             arg0, PARG(0), PARG(1), PARG(2), PARG(3), PARG(4), PARG(5),
@@ -349,7 +349,7 @@ static void allow(const struct su_context *ctx)
     ctx->to.argv[--argc] = arg0;
     execv(ctx->to.shell, ctx->to.argv + argc);
     err = errno;
-    SLOGE("exec");
+    PLOGE("exec");
     fprintf(stderr, "Cannot execute %s: %s\n", ctx->to.shell, strerror(err));
     exit(EXIT_FAILURE);
 }
@@ -437,7 +437,7 @@ int main(int argc, char *argv[])
             errno = 0;
             ctx.to.uid = strtoul(argv[optind], &endptr, 10);
             if (errno || *endptr) {
-                ALOGE("Unknown id: %s\n", argv[optind]);
+                LOGE("Unknown id: %s\n", argv[optind]);
                 fprintf(stderr, "Unknown id: %s\n", argv[optind]);
                 exit(EXIT_FAILURE);
             }
@@ -483,20 +483,20 @@ int main(int argc, char *argv[])
     if (strlen(cm_version) > 0) {
         // only allow su on debuggable builds
         if (strcmp("1", debuggable) != 0) {
-            ALOGE("Root access is disabled on non-debug builds");
+            LOGE("Root access is disabled on non-debug builds");
             deny(&ctx);
         }
 
         // enforce persist.sys.root_access on non-eng builds
         if (strcmp("eng", build_type) != 0 &&
                (atoi(enabled) & 1) != 1 ) {
-            ALOGE("Root access is disabled by system setting - enable it under settings -> developer options");
+            LOGE("Root access is disabled by system setting - enable it under settings -> developer options");
             deny(&ctx);
         }
 
         // disallow su in a shell if appropriate
         if (ctx.from.uid == AID_SHELL && (atoi(enabled) == 1)) {
-            ALOGE("Root access is disabled by a system setting - enable it under settings -> developer options");
+            LOGE("Root access is disabled by a system setting - enable it under settings -> developer options");
             deny(&ctx);
         }
     }
@@ -505,33 +505,33 @@ int main(int argc, char *argv[])
         allow(&ctx);
 
     if (stat(REQUESTOR_DATA_PATH, &st) < 0) {
-        SLOGE("stat");
+        PLOGE("stat");
         deny(&ctx);
     }
 
     if (st.st_gid != st.st_uid)
     {
-        ALOGE("Bad uid/gid %d/%d for Superuser Requestor application",
+        LOGE("Bad uid/gid %d/%d for Superuser Requestor application",
                 (int)st.st_uid, (int)st.st_gid);
         deny(&ctx);
     }
 
     mkdir(REQUESTOR_CACHE_PATH, 0770);
     if (chown(REQUESTOR_CACHE_PATH, st.st_uid, st.st_gid)) {
-        SLOGE("chown (%s, %ld, %ld)", REQUESTOR_CACHE_PATH, st.st_uid, st.st_gid);
+        PLOGE("chown (%s, %ld, %ld)", REQUESTOR_CACHE_PATH, st.st_uid, st.st_gid);
         deny(&ctx);
     }
 
     if (setgroups(0, NULL)) {
-        SLOGE("setgroups");
+        PLOGE("setgroups");
         deny(&ctx);
     }
     if (setegid(st.st_gid)) {
-        SLOGE("setegid (%lu)", st.st_gid);
+        PLOGE("setegid (%lu)", st.st_gid);
         deny(&ctx);
     }
     if (seteuid(st.st_uid)) {
-        SLOGE("seteuid (%lu)", st.st_uid);
+        PLOGE("seteuid (%lu)", st.st_uid);
         deny(&ctx);
     }
 
@@ -579,7 +579,7 @@ int main(int argc, char *argv[])
 
 #define SOCKET_RESPONSE	"socket:"
     if (strncmp(result, SOCKET_RESPONSE, sizeof(SOCKET_RESPONSE) - 1))
-        ALOGW("SECURITY RISK: Requestor still receives credentials in intent");
+        LOGW("SECURITY RISK: Requestor still receives credentials in intent");
     else
         result += sizeof(SOCKET_RESPONSE) - 1;
 
@@ -588,7 +588,7 @@ int main(int argc, char *argv[])
     } else if (!strcmp(result, "ALLOW")) {
         allow(&ctx);
     } else {
-        ALOGE("unknown response from Superuser Requestor: %s", result);
+        LOGE("unknown response from Superuser Requestor: %s", result);
         deny(&ctx);
     }
 
