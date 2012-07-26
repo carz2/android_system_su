@@ -24,18 +24,15 @@
 #include <unistd.h>
 #include <limits.h>
 #include <fcntl.h>
-#include <errno.h>
 #include <endian.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <getopt.h>
 #include <stdint.h>
 #include <pwd.h>
 
 #include <private/android_filesystem_config.h>
 #include <cutils/properties.h>
-#include <cutils/log.h>
 
 #include "su.h"
 #include "utils.h"
@@ -126,6 +123,26 @@ static void populate_environment(const struct su_context *ctx)
     }
 }
 
+void set_identity(unsigned int uid)
+{
+    /*
+     * Set effective uid back to root, otherwise setres[ug]id will fail
+     * if uid isn't root.
+     */
+    if (seteuid(0)) {
+        PLOGE("seteuid (root)");
+        exit(EXIT_FAILURE);
+    }
+    if (setresgid(uid, uid, uid)) {
+        PLOGE("setresgid (%u)", uid);
+        exit(EXIT_FAILURE);
+    }
+    if (setresuid(uid, uid, uid)) {
+        PLOGE("setresuid (%u)", uid);
+        exit(EXIT_FAILURE);
+    }
+}
+
 static void socket_cleanup(void)
 {
     unlink(socket_path);
@@ -151,6 +168,10 @@ static int socket_create_temp(char *path, size_t len)
     if (fd < 0) {
         PLOGE("socket");
         return -1;
+    }
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC)) {
+        PLOGE("fcntl FD_CLOEXEC");
+        goto err;
     }
 
     memset(&sun, 0, sizeof(sun));
@@ -311,25 +332,8 @@ static void allow(const struct su_context *ctx)
         arg0 = p;
     }
 
-    /*
-     * Set effective uid back to root, otherwise setres[ug]id will fail
-     * if ctx->to.uid isn't root.
-     */
-    if (seteuid(0)) {
-        PLOGE("seteuid (root)");
-        exit(EXIT_FAILURE);
-    }
-
     populate_environment(ctx);
-
-    if (setresgid(ctx->to.uid, ctx->to.uid, ctx->to.uid)) {
-        PLOGE("setresgid (%u)", ctx->to.uid);
-        exit(EXIT_FAILURE);
-    }
-    if (setresuid(ctx->to.uid, ctx->to.uid, ctx->to.uid)) {
-        PLOGE("setresuid (%u)", ctx->to.uid);
-        exit(EXIT_FAILURE);
-    }
+	set_identity(ctx->to.uid);
 
 #define PARG(arg)									\
     (ctx->to.optind + (arg) < ctx->to.argc) ? " " : "",					\
@@ -354,6 +358,62 @@ static void allow(const struct su_context *ctx)
     exit(EXIT_FAILURE);
 }
 
+/*
+ * CyanogenMod-specific behavior
+ *
+ * we can't simply use the property service, since we aren't launched from init
+ * and can't trust the location of the property workspace.
+ * Find the properties ourselves.
+ */
+int access_disabled(const struct su_initiator *from)
+{
+    char *data;
+    char build_type[PROPERTY_VALUE_MAX];
+    char debuggable[PROPERTY_VALUE_MAX], enabled[PROPERTY_VALUE_MAX];
+    size_t len;
+
+    data = read_file("/system/build.prop");
+    if (check_property(data, "ro.cm.version")) {
+        get_property(data, build_type, "ro.build.type", "");
+        free(data);
+
+        data = read_file("/default.prop");
+        get_property(data, debuggable, "ro.debuggable", "0");
+        free(data);
+        /* only allow su on debuggable builds */
+        if (strcmp("1", debuggable) != 0) {
+            LOGE("Root access is disabled on non-debug builds");
+            return 1;
+        }
+
+        data = read_file("/data/property/persist.sys.root_access");
+        if (data != NULL) {
+            len = strlen(data);
+            if (len >= PROPERTY_VALUE_MAX)
+                memcpy(enabled, "1", 2);
+            else
+                memcpy(enabled, data, len + 1);
+            free(data);
+        } else
+            memcpy(enabled, "1", 2);
+
+        /* enforce persist.sys.root_access on non-eng builds */
+        if (strcmp("eng", build_type) != 0 && (atoi(enabled) & 1) != 1 ) {
+            LOGE("Root access is disabled by system setting - "
+                 "enable it under settings -> developer options");
+            return 1;
+        }
+
+        /* disallow su in a shell if appropriate */
+        if (from->uid == AID_SHELL && (atoi(enabled) == 1)) {
+            LOGE("Root access is disabled by a system setting - "
+                 "enable it under settings -> developer options");
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     struct su_context ctx = {
@@ -376,10 +436,8 @@ int main(int argc, char *argv[])
     };
     struct stat st;
     int socket_serv_fd, fd;
-    char buf[64], *result, debuggable[PROPERTY_VALUE_MAX];
-    char enabled[PROPERTY_VALUE_MAX], build_type[PROPERTY_VALUE_MAX];
-    char cm_version[PROPERTY_VALUE_MAX];;
-    int c, dballow, len;
+    char buf[64], *result;
+    int c, dballow;
     struct option long_opts[] = {
         { "command",			required_argument,	NULL, 'c' },
         { "help",			no_argument,		NULL, 'h' },
@@ -389,8 +447,6 @@ int main(int argc, char *argv[])
         { "version",			no_argument,		NULL, 'v' },
         { NULL, 0, NULL, 0 },
     };
-    char *data;
-    unsigned sz;
 
     while ((c = getopt_long(argc, argv, "+c:hlmps:Vv", long_opts, NULL)) != -1) {
         switch(c) {
@@ -455,52 +511,16 @@ int main(int argc, char *argv[])
         deny(&ctx);
     }
 
-    // we can't simply use the property service, since we aren't launched from init and
-    // can't trust the location of the property workspace. find the properties ourselves.
-    data = read_file("/default.prop", &sz);
-    get_property(data, debuggable, "ro.debuggable", "0");
-    free(data);
-
-    data = read_file("/system/build.prop", &sz);
-    get_property(data, cm_version, "ro.cm.version", "");
-    get_property(data, build_type, "ro.build.type", "");
-    free(data);
-
-    data = read_file("/data/property/persist.sys.root_access", &sz);
-    if (data != NULL) {
-        len = strlen(data);
-        if (len >= PROPERTY_VALUE_MAX)
-            memcpy(enabled, "1", 2);
-        else
-            memcpy(enabled, data, len + 1);
-        free(data);
-    } else
-        memcpy(enabled, "1", 2);
+    if (access_disabled(&ctx.from))
+        deny(&ctx);
 
     ctx.umask = umask(027);
 
-    // CyanogenMod-specific behavior
-    if (strlen(cm_version) > 0) {
-        // only allow su on debuggable builds
-        if (strcmp("1", debuggable) != 0) {
-            LOGE("Root access is disabled on non-debug builds");
-            deny(&ctx);
-        }
-
-        // enforce persist.sys.root_access on non-eng builds
-        if (strcmp("eng", build_type) != 0 &&
-               (atoi(enabled) & 1) != 1 ) {
-            LOGE("Root access is disabled by system setting - enable it under settings -> developer options");
-            deny(&ctx);
-        }
-
-        // disallow su in a shell if appropriate
-        if (ctx.from.uid == AID_SHELL && (atoi(enabled) == 1)) {
-            LOGE("Root access is disabled by a system setting - enable it under settings -> developer options");
-            deny(&ctx);
-        }
-    }
-
+    /*
+     * set LD_LIBRARY_PATH if the linker has wiped out it due to we're suid.
+     * This occurs on Android 4.0+
+     */
+    setenv("LD_LIBRARY_PATH", "/vendor/lib:/system/lib", 0);
     if (ctx.from.uid == AID_ROOT || ctx.from.uid == AID_SHELL)
         allow(&ctx);
 

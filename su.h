@@ -25,7 +25,7 @@
 
 #define REQUESTOR "com.noshufou.android.su"
 #define REQUESTOR_DATA_PATH "/data/data/" REQUESTOR
-#define REQUESTOR_CACHE_PATH REQUESTOR_DATA_PATH "/cache"
+#define REQUESTOR_CACHE_PATH "/dev/" REQUESTOR
 
 #define REQUESTOR_STORED_PATH REQUESTOR_DATA_PATH "/files/stored"
 #define REQUESTOR_STORED_DEFAULT REQUESTOR_STORED_PATH "/default"
@@ -42,8 +42,8 @@
 #define VERSION_EXTRA	""
 #endif
 
-#define VERSION "3.1.1" VERSION_EXTRA
-#define VERSION_CODE 17
+#define VERSION "3.2" VERSION_EXTRA
+#define VERSION_CODE 18
 
 #define DATABASE_VERSION 6
 #define PROTO_VERSION 0
@@ -79,7 +79,7 @@ enum {
 };
 
 extern int database_check(const struct su_context *ctx);
-
+extern void set_identity(unsigned int uid);
 extern int send_intent(const struct su_context *ctx,
                        const char *socket_path, int allow, const char *action);
 
@@ -87,6 +87,17 @@ static inline char *get_command(const struct su_request *to)
 {
 	return (to->command) ? to->command : to->shell;
 }
+
+#include <cutils/log.h>
+#ifndef LOGE
+#define LOGE(...) ALOGE(__VA_ARGS__)
+#endif
+#ifndef LOGD
+#define LOGD(...) ALOGD(__VA_ARGS__)
+#endif
+#ifndef LOGW
+#define LOGW(...) ALOGW(__VA_ARGS__)
+#endif
 
 #if 0
 #undef LOGE
@@ -97,6 +108,8 @@ static inline char *get_command(const struct su_request *to)
 #define LOGW(fmt,args...) fprintf(stderr, fmt, ##args)
 #endif
 
+#include <errno.h>
+#include <string.h>
 #define PLOGE(fmt,args...) LOGE(fmt " failed with %d: %s", ##args, errno, strerror(errno))
 #define PLOGEV(fmt,err,args...) LOGE(fmt " failed with %d: %s", ##args, err, strerror(err))
 
