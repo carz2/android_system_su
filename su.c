@@ -24,7 +24,6 @@
 #include <unistd.h>
 #include <limits.h>
 #include <fcntl.h>
-#include <endian.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <getopt.h>
@@ -36,9 +35,6 @@
 
 #include "su.h"
 #include "utils.h"
-
-/* Still lazt, will fix this */
-static char socket_path[PATH_MAX];
 
 static int from_init(struct su_initiator *from)
 {
@@ -143,20 +139,63 @@ void set_identity(unsigned int uid)
     }
 }
 
-static void socket_cleanup(void)
+static void socket_cleanup(struct su_context *ctx)
 {
-    unlink(socket_path);
+    if (ctx && ctx->sock_path[0]) {
+        if (unlink(ctx->sock_path))
+            PLOGE("unlink (%s)", ctx->sock_path);
+        ctx->sock_path[0] = 0;
+    }
 }
+
+static void child_cleanup(struct su_context *ctx)
+{
+    pid_t pid = ctx->child;
+    int rc;
+
+    if (!pid) {
+        LOGE("unexpected child");
+        pid = -1;	/* pick up any child */
+    }
+    pid = waitpid(pid, &rc, WNOHANG);
+    if (pid < 0) {
+        PLOGE("waitpid");
+        exit(EXIT_FAILURE);
+    }
+    if (WIFEXITED(rc) && WEXITSTATUS(rc)) {
+        LOGE("child %d terminated with error %d", pid, WEXITSTATUS(rc));
+        exit(EXIT_FAILURE);
+    }
+    if (WIFSIGNALED(rc) && WTERMSIG(rc) != SIGKILL) {
+        LOGE("child %d terminated with signal %d", pid, WTERMSIG(rc));
+        exit(EXIT_FAILURE);
+    }
+    LOGD("child %d terminated, status %d", pid, rc);
+    ctx->child = 0;
+}
+
+/*
+ * For use in signal handlers/atexit-function
+ * NOTE: su_ctx points to main's local variable.
+ *       It's OK due to the program uses exit(3), not return from main()
+ */
+static struct su_context *su_ctx = NULL;
 
 static void cleanup(void)
 {
-    socket_cleanup();
+    socket_cleanup(su_ctx);
 }
 
 static void cleanup_signal(int sig)
 {
-    socket_cleanup();
+    socket_cleanup(su_ctx);
     exit(128 + sig);
+}
+
+void sigchld_handler(int sig)
+{
+    child_cleanup(su_ctx);
+    (void)sig;
 }
 
 static int socket_create_temp(char *path, size_t len)
@@ -206,14 +245,17 @@ static int socket_accept(int serv_fd)
 {
     struct timeval tv;
     fd_set fds;
-    int fd;
+    int fd, rc;
 
     /* Wait 20 seconds for a connection, then give up. */
     tv.tv_sec = 20;
     tv.tv_usec = 0;
     FD_ZERO(&fds);
     FD_SET(serv_fd, &fds);
-    if (select(serv_fd + 1, &fds, NULL, NULL, &tv) < 1) {
+    do {
+        rc = select(serv_fd + 1, &fds, NULL, NULL, &tv);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 1) {
         PLOGE("select");
         return -1;
     }
@@ -300,23 +342,23 @@ static void usage(int status)
     exit(status);
 }
 
-static void deny(const struct su_context *ctx)
+static __attribute__ ((noreturn)) void deny(struct su_context *ctx)
 {
     char *cmd = get_command(&ctx->to);
 
-    send_intent(ctx, "", 0, ACTION_RESULT);
+    send_intent(ctx, DENY, ACTION_RESULT);
     LOGW("request rejected (%u->%u %s)", ctx->from.uid, ctx->to.uid, cmd);
     fprintf(stderr, "%s\n", strerror(EACCES));
     exit(EXIT_FAILURE);
 }
 
-static void allow(const struct su_context *ctx)
+static __attribute__ ((noreturn)) void allow(struct su_context *ctx)
 {
     char *arg0;
     int argc, err;
 
     umask(ctx->umask);
-    send_intent(ctx, "", 1, ACTION_RESULT);
+    send_intent(ctx, ALLOW, ACTION_RESULT);
 
     arg0 = strrchr (ctx->to.shell, '/');
     arg0 = (arg0) ? arg0 + 1 : ctx->to.shell;
@@ -433,11 +475,12 @@ int main(int argc, char *argv[])
             .argc = argc,
             .optind = 0,
         },
+        .child = 0,
     };
     struct stat st;
-    int socket_serv_fd, fd;
+    int c, socket_serv_fd, fd;
     char buf[64], *result;
-    int c, dballow;
+    allow_t dballow;
     struct option long_opts[] = {
         { "command",			required_argument,	NULL, 'c' },
         { "help",			no_argument,		NULL, 'h' },
@@ -507,6 +550,7 @@ int main(int argc, char *argv[])
     }
     ctx.to.optind = optind;
 
+    su_ctx = &ctx;
     if (from_init(&ctx.from) < 0) {
         deny(&ctx);
     }
@@ -557,13 +601,13 @@ int main(int argc, char *argv[])
 
     dballow = database_check(&ctx);
     switch (dballow) {
-        case DB_DENY: deny(&ctx);
-        case DB_ALLOW: allow(&ctx);
-        case DB_INTERACTIVE: break;
-        default: deny(&ctx);
+        case INTERACTIVE: break;
+        case ALLOW: allow(&ctx);	/* never returns */
+        case DENY:
+        default: deny(&ctx);		/* never returns too */
     }
     
-    socket_serv_fd = socket_create_temp(socket_path, sizeof(socket_path));
+    socket_serv_fd = socket_create_temp(ctx.sock_path, sizeof(ctx.sock_path));
     if (socket_serv_fd < 0) {
         deny(&ctx);
     }
@@ -576,7 +620,7 @@ int main(int argc, char *argv[])
     signal(SIGABRT, cleanup_signal);
     atexit(cleanup);
 
-    if (send_intent(&ctx, socket_path, -1, ACTION_REQUEST) < 0) {
+    if (send_intent(&ctx, INTERACTIVE, ACTION_REQUEST) < 0) {
         deny(&ctx);
     }
 
@@ -593,7 +637,7 @@ int main(int argc, char *argv[])
 
     close(fd);
     close(socket_serv_fd);
-    socket_cleanup();
+    socket_cleanup(&ctx);
 
     result = buf;
 
@@ -611,7 +655,4 @@ int main(int argc, char *argv[])
         LOGE("unknown response from Superuser Requestor: %s", result);
         deny(&ctx);
     }
-
-    deny(&ctx);
-    return -1;
 }

@@ -20,16 +20,69 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <paths.h>
-#include <sys/wait.h>
 
 #include "su.h"
 
-int send_intent(const struct su_context *ctx,
-                const char *socket_path, int allow, const char *action)
+static void kill_child(pid_t pid)
 {
-    int rc;
+    LOGD("killing child %d", pid);
+    if (pid) {
+        sigset_t set, old;
 
-    pid_t pid = fork();
+        sigemptyset(&set);
+        sigaddset(&set, SIGCHLD);
+        if (sigprocmask(SIG_BLOCK, &set, &old)) {
+            PLOGE("sigprocmask(SIG_BLOCK)");
+            return;
+        }
+        if (kill(pid, SIGKILL))
+            PLOGE("kill (%d)", pid);
+        else if (sigsuspend(&old) && errno != EINTR)
+            PLOGE("sigsuspend");
+        if (sigprocmask(SIG_SETMASK, &old, NULL))
+            PLOGE("sigprocmask(SIG_BLOCK)");
+    }
+}
+
+static void setup_sigchld_handler(__sighandler_t handler)
+{
+    struct sigaction act;
+
+    act.sa_handler = handler;
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = SA_NOCLDSTOP | SA_RESTART;
+    if (sigaction(SIGCHLD, &act, NULL)) {
+        PLOGE("sigaction(SIGCHLD)");
+        exit(EXIT_FAILURE);
+    }
+}
+
+int send_intent(struct su_context *ctx, allow_t allow, const char *action)
+{
+    const char *socket_path;
+    unsigned int uid = ctx->from.uid;
+    __sighandler_t handler;
+    pid_t pid;
+
+    pid = ctx->child;
+    if (pid) {
+        kill_child(pid);
+        pid = ctx->child;
+        if (pid) {
+            LOGE("child %d is still running", pid);
+            return -1;
+        }
+    }
+    if (allow == INTERACTIVE) {
+        socket_path = ctx->sock_path;
+        handler = sigchld_handler;
+    } else {
+        socket_path = "";
+        handler = SIG_IGN;
+    }
+    setup_sigchld_handler(handler);
+
+    pid = fork();
     /* Child */
     if (!pid) {
         char command[ARG_MAX];
@@ -38,7 +91,7 @@ int send_intent(const struct su_context *ctx,
             "exec /system/bin/am broadcast -a %s --es socket '%s' "
             "--ei caller_uid %d --ei allow %d "
             "--ei version_code %d",
-            action, socket_path, ctx->from.uid, allow, VERSION_CODE);
+            action, socket_path, uid, allow, VERSION_CODE);
         char *args[] = { "sh", "-c", command, NULL, };
 
         /*
@@ -46,7 +99,7 @@ int send_intent(const struct su_context *ctx,
          * the real uid/gid, otherwise LD_LIBRARY_PATH is wiped
          * in Android 4.0+.
          */
-        set_identity(ctx->from.uid);
+        set_identity(uid);
         int zero = open("/dev/zero", O_RDONLY | O_CLOEXEC);
         dup2(zero, 0);
         int null = open("/dev/null", O_WRONLY | O_CLOEXEC);
@@ -62,14 +115,6 @@ int send_intent(const struct su_context *ctx,
         PLOGE("fork");
         return -1;
     }
-    pid = waitpid(pid, &rc, 0);
-    if (pid < 0) {
-        PLOGE("waitpid");
-        return -1;
-    }
-    if (!WIFEXITED(rc) || WEXITSTATUS(rc)) {
-        LOGE("am returned error %d\n", rc);
-        return -1;
-    }
+    ctx->child = pid;
     return 0;
 }
